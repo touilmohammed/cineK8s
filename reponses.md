@@ -1,5 +1,8 @@
 # Examen CinéK8s — Touil Mohammed
 
+> Note : dans mon dépôt, movie-service écoute sur 8085 et ticket-service sur 8086 (et non 8080 comme
+> dans l'énoncé). `MOVIE_URL` vaut donc `http://movie:8085`, fourni par la ConfigMap `ticket-config`.
+
 ## Partie 1
 
 **Q1.1**
@@ -435,3 +438,95 @@ update, sans interruption de service), et les nouveaux conteneurs lisent alors l
 `production`. (À l'inverse, une ConfigMap montée en volume serait rafraîchie, mais l'application
 ne relit pas ses variables d'environnement à chaud.)
 ## Partie 7
+
+**Q7.1**
+Dans le Pod ticket, le résolveur DNS (`/etc/resolv.conf`) pointe vers CoreDNS, qui tourne dans le
+cluster. Grâce au domaine de recherche `cinema-exam.svc.cluster.local`, le nom `movie` est
+résolu en l'adresse **ClusterIP** (virtuelle et stable) du Service `movie`. La requête part vers
+cette IP : les règles de **kube-proxy** (iptables/IPVS) sur le nœud la redirigent (DNAT) vers l'IP
+d'un des Pods movie listés dans les endpoints du Service, donc uniquement des Pods Ready.
+Elle arrive ainsi sur le port 8085 d'un Pod précis, choisi à chaque nouvelle connexion.
+
+**Q7.2**
+```
+simot@isco:~/cineK8s$ for i in $(seq 1 8); do curl -s http://cinema.local/api/tickets | jq length; done
+2
+4
+2
+2
+2
+4
+4
+4
+simot@isco:~/cineK8s$ kubectl delete pod -l app=ticket
+pod "ticket-7bc5799688-fkcjw" deleted from cinema-exam namespace
+pod "ticket-7bc5799688-qx2k6" deleted from cinema-exam namespace
+simot@isco:~/cineK8s$ kubectl rollout status deploy/ticket
+deployment "ticket" successfully rolled out
+simot@isco:~/cineK8s$ curl -si http://cinema.local/api/tickets | head -1
+HTTP/1.1 200
+simot@isco:~/cineK8s$ for i in $(seq 1 6); do curl -s http://cinema.local/api/tickets | jq length; done
+0
+0
+0
+0
+0
+0
+```
+Le nombre varie parce que ticket-service stocke les réservations **en mémoire** dans chaque Pod :
+avec 2 réplicas derrière le Service, chaque appel tombe sur un Pod qui n'a que ses propres
+réservations (2 ou 4). Quand on supprime les Pods ticket, le Deployment en recrée, mais toutes les
+réservations sont perdues (0 partout). La solution architecturale est de rendre ticket
+**stateless** et de déporter l'état dans une base de données externe et persistante (par exemple
+PostgreSQL, avec un volume persistant ou un service managé), partagée par tous les réplicas.
+(Juste après la suppression, mes premières lectures ont échoué en `jq: parse error` : l'Ingress
+n'avait pas encore mis à jour ses backends. Une dizaine de secondes plus tard, tout répondait en 200.)
+
+**Q7.3**
+```
+simot@isco:~/cineK8s$ kubectl delete $(kubectl get pod -l app=movie -o name | head -1)
+pod "movie-56b9c5f45d-jbscp" deleted from cinema-exam namespace
+simot@isco:~/cineK8s$ kubectl get pods
+NAME                      READY   STATUS    RESTARTS   AGE
+movie-56b9c5f45d-p98h6    0/1     Running   0          1s
+movie-56b9c5f45d-sfcf8    1/1     Running   0          64s
+ticket-7bc5799688-r9nhj   1/1     Running   0          3m22s
+ticket-7bc5799688-txrdr   1/1     Running   0          3m22s
+```
+Le Pod supprimé est remplacé immédiatement par un nouveau (`movie-56b9c5f45d-p98h6`, créé 1 s
+après) : le ReplicaSet du Deployment maintient en permanence 2 réplicas, c'est l'auto-réparation.
+Un `kind: Pod` « nu » ne serait jamais recréé : on perdrait l'auto-réparation, mais aussi le
+scaling, les rolling updates et les rollbacks. Le Service n'aurait plus aucun endpoint, donc
+plus de service tant que quelqu'un ne recrée pas le Pod à la main.
+(Avec `-o name`, la sortie est `pod/<nom>` : on écrit donc `kubectl delete $(...)` sans répéter
+`pod`, contrairement à la commande de l'énoncé.)
+
+## Bonus
+
+**B1**
+```
+simot@isco:~/cineK8s$ kubectl exec deploy/movie -- id
+uid=10001(spring) gid=101(spring) groups=101(spring)
+simot@isco:~/cineK8s$ kubectl exec deploy/movie -- touch /test
+touch: cannot touch '/test': Read-only file system
+simot@isco:~/cineK8s$ kubectl exec deploy/movie -- touch /tmp/test && echo "ecriture /tmp OK"
+ecriture /tmp OK
+```
+Le conteneur tourne en UID 10001 non-root, sans élévation de privilèges, sans aucune capability
+Linux, avec un système de fichiers racine en lecture seule. Tomcat a besoin d'écrire dans `/tmp` :
+un volume `emptyDir` y est monté. Les Pods sont `1/1`.
+
+**B2 / QB2**
+```
+simot@isco:~/cineK8s$ cat /tmp/b2.txt
+    300 200
+```
+Résultat : 300 requêtes sur 300 en code 200 pendant un `kubectl rollout restart deploy/movie`,
+donc aucune coupure. Trois éléments y contribuent :
+- La **strategy** `maxUnavailable: 0` / `maxSurge: 1` : Kubernetes crée d'abord un Pod en plus,
+  et ne supprime un ancien Pod que lorsqu'un nouveau est Ready. La capacité ne descend jamais
+  sous 2 Pods.
+- La **readinessProbe** : un nouveau Pod ne reçoit du trafic qu'une fois la probe réussie, donc
+  jamais pendant le démarrage de la JVM. Sans elle, il serait considéré prêt trop tôt.
+- `server.shutdown: graceful` : à l'arrêt d'un ancien Pod, Spring Boot termine les requêtes en
+  cours au lieu de les couper, pendant que le Pod est retiré des endpoints.
