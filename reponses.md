@@ -94,6 +94,51 @@ dans Kubernetes, le Pod est alors retiré des endpoints du Service. Les clients 
 reçoivent plus de requêtes vouées à l'échec, et le Pod revient automatiquement quand
 movie redevient disponible, sans redémarrage.
 ## Partie 3
+**3.1**
+```
+simot@isco:~/cineK8s$ docker images | grep -E 'movie-service|ticket-service'
+movie-service:1.0.0     4bb8dd2b6ac2     331MB     95.2MB
+ticket-service:1.0.0    edfe9ac22d2e     331MB     95.2MB
+simot@isco:~/cineK8s$ docker run --rm --entrypoint id movie-service:1.0.0
+uid=10001(spring) gid=101(spring) groups=101(spring)
+```
+**3.2**
+```
+simot@isco:~/cineK8s$ docker compose ps
+NAME               IMAGE                  SERVICE   STATUS                    PORTS
+cinek8s-movie-1    movie-service:1.0.0    movie     Up 13 seconds (healthy)   0.0.0.0:8085->8085/tcp
+cinek8s-ticket-1   ticket-service:1.0.0   ticket    Up 7 seconds              0.0.0.0:8086->8086/tcp
+simot@isco:~/cineK8s$ curl -s localhost:8085/api/movies/whoami
+{"environment":"compose","hostname":"76b972426643"}
+simot@isco:~/cineK8s$ curl -s -X POST localhost:8086/api/tickets -H 'Content-Type: application/json' -d '{"movieId":1,"seats":2}' | jq
+{
+  "id": 1,
+  "movieId": 1,
+  "movieTitle": "Pod Fiction",
+  "seats": 2,
+  "total": 21.00,
+  "createdAt": "2026-10-08T11:06:02.383768343Z"
+}
+```
+**Q3.1**
+On copie `pom.xml` avant `src/` pour exploiter le cache des couches Docker. Le téléchargement
+des dépendances (`dependency:go-offline`, 89 s au premier build) ne dépend que du pom : tant
+que le pom ne change pas, cette couche est réutilisée. Quand on ne modifie qu'une ligne de
+Java, seules les couches à partir de `COPY src` sont rejouées (compilation, ~12 s) : on ne
+retélécharge pas les dépendances à chaque build.
+**Q3.2**
+`-XX:MaxRAMPercentage=75` dimensionne le heap en pourcentage de la mémoire allouée au
+conteneur (sa limite), alors que `-Xmx512m` fige une valeur. Avec `-Xmx512m`, si la limite
+du Pod est 256 Mi la JVM dépasse et le Pod est tué (OOMKilled) ; si elle est de 2 Gi, on
+gaspille la mémoire. Avec le pourcentage, la même image s'adapte à la limite définie dans
+Kubernetes, sans rebuild, et les 25 % restants couvrent la mémoire hors heap (metaspace,
+threads, mémoire native).
+**Q3.3**
+Kubernetes ne garantit aucun ordre de démarrage. Si les Pods ticket démarrent avant movie,
+leur readiness passe DOWN (le bean `movie` échoue) : ils ne sont pas ajoutés aux endpoints
+du Service, donc ne reçoivent aucun trafic. Leur liveness reste UP, donc ils ne sont pas
+redémarrés. Dès que movie devient disponible, la readiness repasse UP et les Pods entrent
+dans le Service automatiquement. La résilience vient des probes, pas d'un ordre de démarrage.
 ## Partie 4
 ## Partie 5
 ## Partie 6
