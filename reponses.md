@@ -348,5 +348,90 @@ de l'application et de ses dépendances, ce qui est une fuite d'informations uti
 Cela réduit la surface d'attaque : on n'expose que l'API métier.
 
 ## Partie 6
+**6.1 : Prédictions (écrites avant les commandes)**
 
+(a) Après 30 s, les Pods ticket seront `0/1` (READY) avec `RESTARTS` à 0 : la readiness échoue
+car elle appelle movie, mais la liveness reste UP, donc aucun redémarrage.
+(b) `kubectl get endpoints ticket` sera vide (`<none>`), car les Pods non Ready sont retirés
+des endpoints du Service.
+(c) `GET http://cinema.local/api/tickets` renverra un 503 (Service Temporarily Unavailable) :
+le controller nginx n'a plus aucun backend disponible pour le Service ticket.
+(d) La liveness de ticket restera UP : elle ne dépend pas de movie.
+**6.1 : Observations**
+```
+simot@isco:~/cineK8s$ kubectl scale deploy/movie --replicas=0
+deployment.apps/movie scaled
+simot@isco:~/cineK8s$ sleep 30
+simot@isco:~/cineK8s$ kubectl get pods
+NAME                      READY   STATUS    RESTARTS   AGE
+ticket-7bc5799688-fkcjw   0/1     Running   0          34m
+ticket-7bc5799688-qx2k6   0/1     Running   0          34m
+simot@isco:~/cineK8s$ kubectl get endpoints ticket
+NAME     ENDPOINTS   AGE
+ticket               34m
+simot@isco:~/cineK8s$ curl -si http://cinema.local/api/tickets | head -1
+HTTP/1.1 503 Service Temporarily Unavailable
+simot@isco:~/cineK8s$ kubectl scale deploy/movie --replicas=2
+deployment.apps/movie scaled
+simot@isco:~/cineK8s$ kubectl get pods -w
+NAME                      READY   STATUS    RESTARTS   AGE
+movie-568bd7bc65-lfs8f    0/1     Running   0          4s
+movie-568bd7bc65-p7vkg    0/1     Running   0          4s
+ticket-7bc5799688-fkcjw   0/1     Running   0          34m
+ticket-7bc5799688-qx2k6   0/1     Running   0          34m
+movie-568bd7bc65-p7vkg    1/1     Running   0          6s
+movie-568bd7bc65-lfs8f    1/1     Running   0          7s
+ticket-7bc5799688-qx2k6   1/1     Running   0          34m
+ticket-7bc5799688-fkcjw   1/1     Running   0          34m
+simot@isco:~/cineK8s$ kubectl get endpoints ticket
+NAME     ENDPOINTS                           AGE
+ticket   10.244.0.33:8086,10.244.0.34:8086   35m
+```
+Les quatre prédictions sont confirmées : 0/1 avec RESTARTS à 0, endpoints vides, code 503.
+Après `scale --replicas=2`, les Pods ticket repassent `1/1` sans aucune intervention sur ticket.
+Événements retrouvés après coup (le `grep "probe failed"` sur `describe` n'affichait rien, les
+événements étant dans `kubectl get events`) :
+```
+simot@isco:~/cineK8s$ kubectl get events --sort-by=.lastTimestamp | grep -i -E 'unhealthy|probe'
+2m56s  Warning  Unhealthy  pod/ticket-7bc5799688-qx2k6  Readinessprobe failed: Get "http://10.244.0.33:8086/actuator/health/readiness": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+2m56s  Warning  Unhealthy  pod/ticket-7bc5799688-fkcjw  Readinessprobe failed: Get "http://10.244.0.34:8086/actuator/health/readiness": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+2m14s  Warning  Unhealthy  pod/ticket-7bc5799688-qx2k6  Readinessprobe failed: HTTP probe failed with statuscode: 503
+2m14s  Warning  Unhealthy  pod/ticket-7bc5799688-fkcjw  Readinessprobe failed: HTTP probe failed with statuscode: 503
+```
+Seules les lignes `Readinessprobe failed` concernent la panne : aucune `Liveness probe failed`
+n'apparaît pour ticket, ce qui explique `RESTARTS` à 0. (Les `Startup probe failed` sont ceux du
+démarrage normal des JVM.)
+
+**6.2**
+
+| # | Statut observé | Commande de diagnostic | Cause exacte | Correction apportée |
+|---|---|---|---|---|
+| 1 | `ErrImagePull` puis `ImagePullBackOff` | `kubectl describe pod -l app=ticket-debug` (Events) : `Failed to pull image "ticket-service:1.0.0" ... pull access denied, repository does not exist` | `imagePullPolicy: Always` force un pull depuis Docker Hub, où l'image n'existe pas (elle n'est que sur le nœud Minikube) | `imagePullPolicy: IfNotPresent` |
+| 2 | `CreateContainerConfigError` | `kubectl describe pod ticket-debug-748f79d8cf-dclwv` (Events) : `Error: configmap "ticket-configmap" not found` | `envFrom` référence une ConfigMap inexistante : la vraie s'appelle `ticket-config` | `name: ticket-config` |
+| 3 | `Running` mais `0/1` en permanence | `kubectl describe pod ticket-debug-c9999c4dc-lh8vl` (Events) : `Readiness probe failed: Get "http://10.244.0.39:8081/actuator/health/readiness": connect: connection refused` | La readinessProbe interroge le port 8081 alors que l'application écoute sur 8086 (le `containerPort: 8080` était aussi faux) | `port: http` dans la probe et `containerPort: 8086` |
+
+Résultat final : `ticket-debug-7b8ccfd697-lpxhb` en `1/1 Running`, puis supprimé avec
+`kubectl delete -f broken/ticket-debug.yaml`.
+
+**Q6.1**
+1. `scale --replicas=0` supprime tous les Pods movie : le Service `movie` n'a plus aucun endpoint.
+2. La readiness de ticket inclut l'indicateur `movie`, qui appelle movie en HTTP : l'appel
+   échoue, et après 3 échecs consécutifs (3 × 5 s) le kubelet marque les Pods ticket NotReady (`0/1`).
+3. Le contrôleur d'endpoints retire alors les IP des Pods non Ready du Service `ticket` : sa liste
+   d'endpoints devient vide.
+4. Le controller ingress-nginx n'a plus aucun backend pour `/api/tickets` et répond lui-même
+   par un 503 (la règle d'Ingress existe toujours, mais sans destination disponible).
+
+`RESTARTS` reste à 0 parce que la liveness de ticket (`/actuator/health/liveness`) ne dépend pas
+de movie : elle reste UP. Seul l'échec de la liveness ou de la startupProbe fait redémarrer un
+conteneur, alors qu'un échec de readiness ne fait que retirer le Pod du trafic. Quand movie
+revient, la readiness repasse UP et les Pods rejoignent le Service automatiquement.
+**Q6.3**
+Les variables d'environnement d'un conteneur sont figées à sa création : le kubelet lit la
+ConfigMap une seule fois, au démarrage du Pod, via `envFrom`. Modifier la ConfigMap met à jour
+l'objet dans l'API, mais pas les Pods déjà lancés, qui gardent l'ancienne valeur. C'est
+`kubectl rollout restart deploy/movie` qui l'a rendue effective : il recrée les Pods (rolling
+update, sans interruption de service), et les nouveaux conteneurs lisent alors la valeur
+`production`. (À l'inverse, une ConfigMap montée en volume serait rafraîchie, mais l'application
+ne relit pas ses variables d'environnement à chaud.)
 ## Partie 7
