@@ -264,6 +264,89 @@ Or `movie-service:1.0.0` et `ticket-service:1.0.0` n'existent que dans le nœud 
 (chargées avec `minikube image load`), pas sur un registre public. Les Pods resteraient en
 `ErrImagePull` puis `ImagePullBackOff` et ne démarreraient jamais. `IfNotPresent` utilise
 l'image locale si elle est déjà présente, ce qui est le bon choix ici.
+
 ## Partie 5
+**5.1**
+```
+simot@isco:~/cineK8s$ kubectl get pods -n ingress-nginx
+NAME                                       READY   STATUS      RESTARTS        AGE
+ingress-nginx-admission-create-nppfb       0/1     Completed   0               46h
+ingress-nginx-admission-patch-zwzqf        0/1     Completed   1 (46h ago)     46h
+ingress-nginx-controller-d7cd8c989-msv7l   1/1     Running     1 (4h50m ago)   46h
+simot@isco:~/cineK8s$ kubectl get ingressclass
+NAME              CONTROLLER             PARAMETERS   AGE
+nginx (default)   k8s.io/ingress-nginx   <none>       46h
+simot@isco:~/cineK8s$ grep cinema.local /etc/hosts
+127.0.0.1 cinema.local
+```
+Avec le driver Docker sous WSL, `minikube ip` n'est pas joignable : j'utilise `minikube tunnel`
+et `127.0.0.1 cinema.local` dans `/etc/hosts`.
+
+**5.2**
+Fichier `k8s/40-ingress.yaml` : `networking.k8s.io/v1`, `ingressClassName: nginx`, hôte
+`cinema.local`, `/api/movies` vers le Service `movie` et `/api/tickets` vers le Service `ticket`
+(`pathType: Prefix`, port nommé `http`).
+```
+simot@isco:~/cineK8s$ kubectl describe ingress cinema
+Name:             cinema
+Namespace:        cinema-exam
+Ingress Class:    nginx
+Rules:
+  Host          Path  Backends
+  ----          ----  --------
+  cinema.local
+                /api/movies    movie:http (10.244.0.32:8085,10.244.0.31:8085)
+                /api/tickets   ticket:http (10.244.0.34:8086,10.244.0.33:8086)
+```
+
+**5.3**
+```
+simot@isco:~/cineK8s$ curl -s http://cinema.local/api/movies | jq '.[].title'
+"Pod Fiction"
+"Le Seigneur des Pods"
+"Docker Wars"
+"Rollback to the Future"
+simot@isco:~/cineK8s$ curl -s -X POST http://cinema.local/api/tickets -H 'Content-Type: application/json' -d '{"movieId":3,"seats":10}' | jq
+{
+  "id": 2,
+  "movieId": 3,
+  "movieTitle": "Docker Wars",
+  "seats": 10,
+  "total": 90.00,
+  "createdAt": "2026-10-08T11:42:10.839311163Z"
+}
+simot@isco:~/cineK8s$ for i in $(seq 1 6); do curl -s http://cinema.local/api/movies/whoami | jq -r .hostname; done
+movie-568bd7bc65-nshcx
+movie-568bd7bc65-nshcx
+movie-568bd7bc65-gqrpk
+movie-568bd7bc65-gqrpk
+movie-568bd7bc65-gqrpk
+movie-568bd7bc65-nshcx
+simot@isco:~/cineK8s$ curl -s -o /dev/null -w '%{http_code}\n' http://cinema.local/actuator/health
+404
+```
+
+**Q5.1**
+Deux Pods movie distincts ont répondu (`movie-568bd7bc65-nshcx` et `movie-568bd7bc65-gqrpk`),
+3 requêtes chacun. L'objet qui répartit la charge est le **Service** `movie` : il regroupe les
+Pods portant le label `app: movie` (ses endpoints) et sert de point d'entrée stable. Ici, le
+controller ingress-nginx lit ces endpoints et répartit lui-même les requêtes entre les deux
+Pods ; pour les appels internes (ticket vers movie), c'est kube-proxy qui répartit via le
+Service. L'Ingress, lui, ne fait que le routage par hôte et par chemin vers le bon Service.
+
+**Q5.2**
+Avec `pathType: Exact` sur `/api/movies`, seule l'URL exactement égale à `/api/movies`
+correspondrait. `GET /api/movies/1` ne correspondrait à aucune règle et recevrait un 404 du
+controller nginx, sans jamais atteindre le Service. `Prefix` route `/api/movies` et tout ce qui
+est en dessous (`/api/movies/1`, `/api/movies/whoami`).
+
+**Q5.3**
+J'obtiens un **404**. C'est souhaitable : l'Ingress n'expose que `/api/movies` et `/api/tickets`,
+et aucune règle ne route `/actuator`. Les endpoints Actuator sont destinés aux probes du kubelet
+et à l'exploitation, depuis l'intérieur du cluster. Les exposer à l'extérieur révélerait l'état
+de l'application et de ses dépendances, ce qui est une fuite d'informations utile à un attaquant.
+Cela réduit la surface d'attaque : on n'expose que l'API métier.
+
 ## Partie 6
+
 ## Partie 7
